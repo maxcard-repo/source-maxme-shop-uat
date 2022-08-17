@@ -1,36 +1,123 @@
-# This is a basic workflow to help you get started with Actions
+name: "CICD - Maxme Shop UAT"
 
-name: CI
-
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
   push:
-    branches: [ "main" ]
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+      - '.github/workflows/**'
+      - 'k8s_deployment/**'
   pull_request:
-    branches: [ "main" ]
-
-  # Allows you to run this workflow manually from the Actions tab
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+      - '.github/workflows/**'
+      - 'k8s_deployment/**'
   workflow_dispatch:
-
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+    
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  job1:
+    name: "CI Testing"
     runs-on: ubuntu-latest
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
+    strategy:
+      matrix:
+        node-version: [12.x]  ## change to your node version
+        # See supported Node.js release schedule at https://nodejs.org/en/about/releases/
+
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v3
+    - uses: actions/checkout@v3
+    - name: Use Node.js ${{ matrix.node-version }}
+      id: ci-test
+      uses: actions/setup-node@v3
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
+    - run: npm ci
+  
+  job2:
+    needs: [job1]
+    if: ${{ always() && needs.job1.result == 'failure' }}
+    name: CI failure notification
+    runs-on: ubuntu-latest
+    steps:
+    - name: Discord notification after failed
+      env:
+        DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      uses: Ilshidur/action-discord@master
+      with: 
+          args: |
+            ```ERROR!!! The project {{ GITHUB_REPOSITORY }} CI test has failed. 
+            Please verify code again before commit. Please check more information in github action.  
+            Commit by {{ GITHUB_ACTOR }}.```
+          
+  job3:
+    needs: [job1]
+    if: ${{ needs.job1.result == 'success' }}
+    name: "Build image"
+    runs-on: ubuntu-latest  
+    steps:
+    - name: "Checkout code"
+      uses: actions/checkout@v3
+    
+    - name: "Configure AWS credentials"
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_UAT }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_UAT }}
+        aws-region: ap-southeast-1
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
+    - name: "Login to Amazon ECR"
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
 
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
-        run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+    - name: "Build, tag, and push image to Amazon ECR"
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: shop-uat
+        IMAGE_TAG: ${{ github.sha }}
+        
+      run: |
+        new_img="$ECR_REPOSITORY:$IMAGE_TAG"
+        sed -i 's/'"$ECR_REPOSITORY.*"'/'"$new_img"'/g' ./k8s_deployment/deployment.yaml
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+    
+    - name: "Git auto commit"
+      uses: stefanzweifel/git-auto-commit-action@v4
+      with:
+        commit_message: Apply automate changed
+        
+    - uses: actions/checkout@v2
+    - name: Sync ArgoCD Application
+      uses: omegion/argocd-actions@master
+      with:
+          address: "maxme-argocd-uat.maxcard.tech"
+          token: ${{ secrets.ARGOCD_TOKEN_UAT }}
+          action: sync
+          appName: "shop"
+    
+    - run: sleep 10
+
+    - name: Discord notification
+      env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      uses: Ilshidur/action-discord@master
+      with:
+          args: '```The project {{ EVENT_PAYLOAD.repository.full_name }} has been deployed. Commit by {{ GITHUB_ACTOR }}```'
+          
+  job4:
+    needs: [job3]
+    if: ${{ always() && needs.job3.result == 'failure' }}
+    name: Build failure notification
+    runs-on: ubuntu-latest
+    steps:
+    - name: Discord notification after failed
+      env:
+        DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      uses: Ilshidur/action-discord@master
+      with: 
+          args: |
+            ```ERROR!!! The project {{ GITHUB_REPOSITORY }} build has failed.
+            Please check more information in github action.  
+            Commit by {{ GITHUB_ACTOR }}.```
